@@ -24,6 +24,18 @@ For each provider:
 swiftc main.swift -o ai-limits-widget
 ```
 
+## Install (short command)
+
+```sh
+./install.sh
+```
+
+This builds the binary and symlinks it as `ailimits` into a writable dir in your PATH (e.g. `/opt/homebrew/bin`). After that you can run from anywhere:
+
+```sh
+ailimits
+```
+
 ## Run
 
 ```sh
