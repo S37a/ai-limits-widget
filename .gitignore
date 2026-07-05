@@ -5,6 +5,7 @@ build/
 *.o
 *.d
 ai-limits-widget
+ai-limits-widget
 
 # Secrets — never commit
 auth.json

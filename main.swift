@@ -1,28 +1,9 @@
-import Cocoa
-import SwiftUI
 import Foundation
-import WebKit
 import SQLite3
 
 // MARK: - Data models
 
-struct ProviderRow: Identifiable {
-    let id: String
-    let name: String
-    let type: String          // "oauth" | "api" | "wellknown" | "env"
-    let label: String         // account label from OpenRouter, or "—"
-    let models: [ModelUsage]
-    let limit: String         // "—" if unknown
-    let remaining: String
-    let usageToday: String
-    let usageWeek: String
-    let usageMonth: String
-    let resetAt: String       // human readable "—" or "3h 12m"
-    let resetProgress: Double // 0.0..1.0 for the bar
-}
-
-struct ModelUsage: Identifiable {
-    let id: String            // "provider/model"
+struct ModelUsage {
     let modelID: String
     let providerID: String
     let messages: Int
@@ -33,14 +14,24 @@ struct ModelUsage: Identifiable {
     let lastUsed: Date?
 }
 
-// MARK: - AppState
+struct ProviderRow {
+    let id: String
+    let name: String
+    let type: String
+    let label: String
+    let models: [ModelUsage]
+    let limit: String
+    let remaining: String
+    let resetAt: String
+    let resetProgress: Double
+    let usageToday: String
+    let usageWeek: String
+    let usageMonth: String
+}
 
-final class AppState: ObservableObject {
-    @Published var rows: [ProviderRow] = []
-    @Published var lastUpdated: Date = Date()
-    @Published var lastError: String?
-    @Published var isRefreshing: Bool = false
+// MARK: - State
 
+final class Limits {
     private let authURL = FileManager.default
         .homeDirectoryForCurrentUser
         .appendingPathComponent(".local/share/opencode/auth.json")
@@ -48,41 +39,20 @@ final class AppState: ObservableObject {
         .homeDirectoryForCurrentUser
         .appendingPathComponent(".local/share/opencode/opencode.db")
 
-    init() {
-        Task { await refresh() }
-    }
-
-    func refresh() async {
-        await MainActor.run {
-            self.isRefreshing = true
-            self.lastError = nil
+    func fetch() -> [ProviderRow] {
+        guard let auth = try? readAuth() else { return [] }
+        var rows: [ProviderRow] = []
+        for (providerID, entry) in auth {
+            rows.append(buildRow(providerID: providerID, authEntry: entry))
         }
-        do {
-            let auth = try readAuth()
-            var rows: [ProviderRow] = []
-            for (providerID, authEntry) in auth {
-                let row = try await buildRow(providerID: providerID, authEntry: authEntry)
-                rows.append(row)
-            }
-            // stable order: anthropic, openai, openrouter, google, ollama-cloud, then rest
-            let order = ["anthropic", "openai", "openrouter", "google", "ollama-cloud"]
-            rows.sort { a, b in
-                let ai = order.firstIndex(of: a.id) ?? Int.max
-                let bi = order.firstIndex(of: b.id) ?? Int.max
-                if ai != bi { return ai < bi }
-                return a.id < b.id
-            }
-            await MainActor.run {
-                self.rows = rows
-                self.lastUpdated = Date()
-                self.isRefreshing = false
-            }
-        } catch {
-            await MainActor.run {
-                self.lastError = error.localizedDescription
-                self.isRefreshing = false
-            }
+        let order = ["anthropic", "openai", "openrouter", "google", "ollama-cloud"]
+        rows.sort { a, b in
+            let ai = order.firstIndex(of: a.id) ?? Int.max
+            let bi = order.firstIndex(of: b.id) ?? Int.max
+            if ai != bi { return ai < bi }
+            return a.id < b.id
         }
+        return rows
     }
 
     // MARK: auth.json
@@ -97,49 +67,34 @@ final class AppState: ObservableObject {
 
     private func readAuth() throws -> [String: AuthEntry] {
         let data = try Data(contentsOf: authURL)
-        let decoded = try JSONDecoder().decode([String: AuthEntry].self, from: data)
-        return decoded
+        return try JSONDecoder().decode([String: AuthEntry].self, from: data)
     }
 
-    // MARK: build one row per provider
+    // MARK: build row
 
-    private func buildRow(providerID: String, authEntry: AuthEntry) async throws -> ProviderRow {
-        let models = try queryModelsFromDB(providerID: providerID)
-        let displayName = prettyName(providerID)
+    private func buildRow(providerID: String, authEntry: AuthEntry) -> ProviderRow {
+        let models = (try? queryModelsFromDB(providerID: providerID)) ?? []
+        let name = prettyName(providerID)
 
-        // OpenRouter: hit the real API
         if providerID == "openrouter", let key = authEntry.key {
-            return try await openRouterRow(providerID: providerID, key: key, models: models, displayName: displayName)
+            return openRouterRow(providerID: providerID, key: key, models: models, name: name, type: authEntry.type)
         }
-        // Google: no public quota API for AI Studio keys; show local usage only
-        // Ollama Cloud: no public quota API; show local usage only
-        // Anthropic / OpenAI: oauth, no quota API; show local usage only
-        return localOnlyRow(providerID: providerID, type: authEntry.type, models: models, displayName: displayName)
+        return localOnlyRow(providerID: providerID, type: authEntry.type, models: models, name: name)
     }
 
-    private func localOnlyRow(providerID: String, type: String, models: [ModelUsage], displayName: String) -> ProviderRow {
+    private func localOnlyRow(providerID: String, type: String, models: [ModelUsage], name: String) -> ProviderRow {
         let (today, week, month) = aggregateWindows(models: models)
         return ProviderRow(
-            id: providerID,
-            name: displayName,
-            type: type,
-            label: "—",
+            id: providerID, name: name, type: type, label: "—",
             models: models,
-            limit: "—",
-            remaining: "—",
-            usageToday: today,
-            usageWeek: week,
-            usageMonth: month,
-            resetAt: "no public limit",
-            resetProgress: 0
+            limit: "—", remaining: "—", resetAt: "no public limit", resetProgress: 0,
+            usageToday: today, usageWeek: week, usageMonth: month
         )
     }
 
-    // MARK: OpenRouter API
+    // MARK: OpenRouter API (synchronous for console)
 
-    private struct ORKeyResponse: Decodable {
-        let data: ORKeyData
-    }
+    private struct ORKeyResponse: Decodable { let data: ORKeyData }
     private struct ORKeyData: Decodable {
         let label: String?
         let usage: Double?
@@ -148,7 +103,7 @@ final class AppState: ObservableObject {
         let usageMonthly: Double?
         let limit: Double?
         let limitRemaining: Double?
-        let limitReset: Double? // ms epoch
+        let limitReset: Double?
         let isFreeTier: Bool?
         enum CodingKeys: String, CodingKey {
             case label, usage, limit
@@ -160,9 +115,7 @@ final class AppState: ObservableObject {
             case isFreeTier = "is_free_tier"
         }
     }
-    private struct ORCreditsResponse: Decodable {
-        let data: ORCreditsData
-    }
+    private struct ORCreditsResponse: Decodable { let data: ORCreditsData }
     private struct ORCreditsData: Decodable {
         let totalCredits: Double?
         let totalUsage: Double?
@@ -172,25 +125,39 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func openRouterRow(providerID: String, key: String, models: [ModelUsage], displayName: String) async throws -> ProviderRow {
+    private func syncFetch(url: URL, headers: [String: String]) -> Data? {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 10
+        for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+        let sem = DispatchSemaphore(value: 0)
+        var result: Data?
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            result = data
+            sem.signal()
+        }.resume()
+        sem.wait()
+        return result
+    }
+
+    private func openRouterRow(providerID: String, key: String, models: [ModelUsage], name: String, type: String) -> ProviderRow {
         var keyData: ORKeyData?
         var credits: ORCreditsData?
-        do {
-            keyData = try await getJSON(url: "https://openrouter.ai/api/v1/key", headers: ["Authorization": "Bearer \(key)"])
-        } catch {
-            // fall through — we still show local usage
+
+        if let url = URL(string: "https://openrouter.ai/api/v1/key") {
+            if let data = syncFetch(url: url, headers: ["Authorization": "Bearer \(key)"]),
+               let decoded = try? JSONDecoder().decode(ORKeyResponse.self, from: data) {
+                keyData = decoded.data
+            }
         }
-        do {
-            credits = try await getJSON(url: "https://openrouter.ai/api/v1/credits", headers: ["Authorization": "Bearer \(key)"])
-        } catch {
-            // ignore
+        if let url = URL(string: "https://openrouter.ai/api/v1/credits") {
+            if let data = syncFetch(url: url, headers: ["Authorization": "Bearer \(key)"]),
+               let decoded = try? JSONDecoder().decode(ORCreditsResponse.self, from: data) {
+                credits = decoded.data
+            }
         }
 
         let (today, week, month) = aggregateWindows(models: models)
-        let limit: String
-        let remaining: String
-        let resetAt: String
-        let resetProgress: Double
+        var limit = "—", remaining = "—", resetAt = "—", progress: Double = 0
 
         if let kd = keyData, let lim = kd.limit, lim > 0 {
             let rem = kd.limitRemaining ?? (lim - (kd.usage ?? 0))
@@ -199,122 +166,72 @@ final class AppState: ObservableObject {
             if let reset = kd.limitReset, reset > 0 {
                 let secs = (reset / 1000) - Date().timeIntervalSince1970
                 resetAt = secs > 0 ? humanDuration(secs: secs) : "—"
-                resetProgress = 1 - min(max(rem / lim, 0), 1)
+                progress = lim > 0 ? 1 - min(max(rem / lim, 0), 1) : 0
             } else {
                 resetAt = "no reset"
-                resetProgress = lim > 0 ? 1 - min(max(rem / lim, 0), 1) : 0
+                progress = lim > 0 ? 1 - min(max(rem / lim, 0), 1) : 0
             }
         } else if let c = credits, let total = c.totalCredits, total > 0 {
             let used = c.totalUsage ?? 0
             limit = "$\(fmt(total))"
             remaining = "$\(fmt(max(total - used, 0)))"
             resetAt = "credits"
-            resetProgress = total > 0 ? min(used / total, 1) : 0
+            progress = min(used / total, 1)
         } else if let kd = keyData, (kd.isFreeTier ?? false) {
             limit = "free tier"
-            remaining = "—"
-            resetAt = "—"
-            resetProgress = 0
-        } else {
-            limit = "—"
-            remaining = "—"
-            resetAt = "—"
-            resetProgress = 0
         }
 
         return ProviderRow(
-            id: providerID,
-            name: displayName,
-            type: "api",
-            label: keyData?.label ?? "—",
+            id: providerID, name: name, type: type, label: keyData?.label ?? "—",
             models: models,
-            limit: limit,
-            remaining: remaining,
-            usageToday: today,
-            usageWeek: week,
-            usageMonth: month,
-            resetAt: resetAt,
-            resetProgress: resetProgress
+            limit: limit, remaining: remaining, resetAt: resetAt, resetProgress: progress,
+            usageToday: today, usageWeek: week, usageMonth: month
         )
     }
 
-    private func getJSON<T: Decodable>(url: String, headers: [String: String]) async throws -> T {
-        guard let u = URL(string: url) else { throw URLError(.badURL) }
-        var req = URLRequest(url: u)
-        req.timeoutInterval = 12
-        for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        if let http = resp as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw URLError(.badServerResponse)
-        }
-        return try JSONDecoder().decode(T.self, from: data)
-    }
-
-    // MARK: opencode SQLite
+    // MARK: SQLite
 
     private func queryModelsFromDB(providerID: String) throws -> [ModelUsage] {
-        // model column is JSON like {"id":"glm-5.2","providerID":"ollama-cloud","variant":"max"}
-        // session table has aggregated columns tokens_input/output/cache_read and cost
         let since = Int(Date().addingTimeInterval(-30*24*60*60).timeIntervalSince1970 * 1000)
         let sql = """
-        SELECT
-            json_extract(model,'$.id') AS mid,
-            json_extract(model,'$.providerID') AS pid,
-            count(*) AS n,
-            sum(tokens_input) AS ti,
-            sum(tokens_output) AS to,
-            sum(tokens_cache_read) AS cr,
-            sum(cost) AS c,
-            max(time_created) AS last
+        SELECT json_extract(model,'$.id'), json_extract(model,'$.providerID'),
+               count(*), sum(tokens_input), sum(tokens_output),
+               sum(tokens_cache_read), sum(cost), max(time_created)
         FROM session
-        WHERE json_extract(model,'$.providerID') = ?
-          AND time_created >= ?
-        GROUP BY mid
-        ORDER BY ti DESC
-        LIMIT 8
+        WHERE json_extract(model,'$.providerID') = ? AND time_created >= ?
+        GROUP BY json_extract(model,'$.id')
+        ORDER BY sum(tokens_input) DESC LIMIT 8
         """
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_close_v2(db) }
+
         var stmt: OpaquePointer?
-        guard sqlite3_open_v2(dbURL.path, &stmt, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
-            throw NSError(domain: "sqlite", code: 1, userInfo: [NSLocalizedDescriptionKey: "cannot open db"])
-        }
-        defer { sqlite3_close_v2(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
 
-        var s: OpaquePointer?
-        guard sqlite3_prepare_v2(stmt, sql, -1, &s, nil) == SQLITE_OK else {
-            throw NSError(domain: "sqlite", code: 2, userInfo: [NSLocalizedDescriptionKey: "cannot prepare: \(String(cString: sqlite3_errmsg(stmt)))"])
-        }
-        defer { sqlite3_finalize(s) }
-
-        sqlite3_bind_text(s, 1, providerID, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-        sqlite3_bind_int64(s, 2, Int64(since))
+        sqlite3_bind_text(stmt, 1, providerID, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_int64(stmt, 2, Int64(since))
 
         var rows: [ModelUsage] = []
-        while sqlite3_step(s) == SQLITE_ROW {
-            let mid = String(cString: sqlite3_column_text(s, 0))
-            let pid = String(cString: sqlite3_column_text(s, 1))
-            let n = Int(sqlite3_column_int64(s, 2))
-            let ti = Int(sqlite3_column_int64(s, 3))
-            let to = Int(sqlite3_column_int64(s, 4))
-            let cr = Int(sqlite3_column_int64(s, 5))
-            let c = sqlite3_column_double(s, 6)
-            let lastMs = sqlite3_column_int64(s, 7)
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let mid = String(cString: sqlite3_column_text(stmt, 0))
+            let pid = String(cString: sqlite3_column_text(stmt, 1))
+            let n = Int(sqlite3_column_int64(stmt, 2))
+            let ti = Int(sqlite3_column_int64(stmt, 3))
+            let to = Int(sqlite3_column_int64(stmt, 4))
+            let cr = Int(sqlite3_column_int64(stmt, 5))
+            let c = sqlite3_column_double(stmt, 6)
+            let lastMs = sqlite3_column_int64(stmt, 7)
             let last = lastMs > 0 ? Date(timeIntervalSince1970: TimeInterval(lastMs)/1000) : nil
-            rows.append(ModelUsage(
-                id: "\(pid)/\(mid)",
-                modelID: mid,
-                providerID: pid,
-                messages: n,
-                inputTokens: ti,
-                outputTokens: to,
-                cacheRead: cr,
-                cost: c,
-                lastUsed: last
-            ))
+            rows.append(ModelUsage(modelID: mid, providerID: pid, messages: n,
+                                   inputTokens: ti, outputTokens: to,
+                                   cacheRead: cr, cost: c, lastUsed: last))
         }
         return rows
     }
 
-    // MARK: aggregation helpers
+    // MARK: helpers
 
     private func aggregateWindows(models: [ModelUsage]) -> (String, String, String) {
         let now = Date()
@@ -322,7 +239,6 @@ final class AppState: ObservableObject {
         let dayStart = cal.startOfDay(for: now).timeIntervalSince1970 * 1000
         let weekStart = (now.addingTimeInterval(-7*24*60*60)).timeIntervalSince1970 * 1000
         let monthStart = (now.addingTimeInterval(-30*24*60*60)).timeIntervalSince1970 * 1000
-
         func sumSince(_ sinceMs: Double) -> Int {
             models.reduce(0) { acc, m in
                 guard let last = m.lastUsed else { return acc }
@@ -332,13 +248,8 @@ final class AppState: ObservableObject {
                 return acc
             }
         }
-        let today = sumSince(dayStart)
-        let week = sumSince(weekStart)
-        let month = sumSince(monthStart)
-        return (fmtTokens(today), fmtTokens(week), fmtTokens(month))
+        return (fmtTokens(sumSince(dayStart)), fmtTokens(sumSince(weekStart)), fmtTokens(sumSince(monthStart)))
     }
-
-    // MARK: pretty
 
     private func prettyName(_ id: String) -> String {
         switch id {
@@ -351,8 +262,7 @@ final class AppState: ObservableObject {
         }
     }
     private func fmt(_ v: Double) -> String {
-        if v >= 1 { return String(format: "%.2f", v) }
-        return String(format: "%.4f", v)
+        v >= 1 ? String(format: "%.2f", v) : String(format: "%.4f", v)
     }
     private func fmtTokens(_ n: Int) -> String {
         if n >= 1_000_000 { return String(format: "%.1fM", Double(n)/1_000_000) }
@@ -362,208 +272,165 @@ final class AppState: ObservableObject {
     private func humanDuration(secs: TimeInterval) -> String {
         let h = Int(secs) / 3600
         let m = (Int(secs) % 3600) / 60
-        if h > 0 { return "\(h)h \(m)m" }
-        return "\(m)m"
+        return h > 0 ? "\(h)h \(m)m" : "\(m)m"
     }
 }
 
-// MARK: - SwiftUI popover content
+// MARK: - ANSI helpers
 
-struct PopoverRoot: View {
-    @ObservedObject var state: AppState
+enum A {
+    static let clear = "\u{1B}[2J\u{1B}[H"
+    static let bold = "\u{1B}[1m"
+    static let dim = "\u{1B}[2m"
+    static let reset = "\u{1B}[0m"
+    static let green = "\u{1B}[32m"
+    static let yellow = "\u{1B}[33m"
+    static let red = "\u{1B}[31m"
+    static let cyan = "\u{1B}[36m"
+    static let magenta = "\u{1B}[35m"
+    static func cursor(_ row: Int, _ col: Int) -> String { "\u{1B}[\(row);\(col)H" }
+}
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            header
-            Divider().background(Color.secondary.opacity(0.3))
-            ScrollView {
-                VStack(spacing: 10) {
-                    ForEach(state.rows) { row in
-                        ProviderCard(row: row)
-                    }
-                    if let err = state.lastError {
-                        Text(err).font(.caption).foregroundStyle(.red).padding(8)
-                    }
-                }
-                .padding(10)
-            }
-            footer
-        }
-        .frame(width: 420, height: 540)
+// MARK: - Render
+
+func bar(_ progress: Double, width: Int = 20) -> String {
+    let filled = Int(progress * Double(width))
+    let pct = Int(progress * 100)
+    let color = progress > 0.8 ? A.red : (progress > 0.5 ? A.yellow : A.green)
+    let blocks = String(repeating: "█", count: max(filled, 0))
+    let empty = String(repeating: "░", count: max(width - filled, 0))
+    return "\(color)\(blocks)\(empty)\(A.reset) \(pct)%"
+}
+
+func render(rows: [ProviderRow], updated: Date, refreshing: Bool) {
+    var out = A.clear
+    out += "\(A.bold)╔════════════════════════════════════════════════════════════╗\(A.reset)\n"
+    out += "\(A.bold)║\(A.reset) \(A.cyan)\(A.bold)AI LIMITS\(A.reset)\(A.dim) — opencode providers\(A.reset)"
+    let headerRight = refreshing ? "\(A.dim)refreshing…\(A.reset)" : "updated \(updated.formatted(date: .omitted, time: .shortened))"
+    let pad = String(repeating: " ", count: max(0, 60 - 23 - headerRight.count))
+    out += "\(pad)\(headerRight) \(A.bold)║\(A.reset)\n"
+    out += "\(A.bold)╚════════════════════════════════════════════════════════════╝\(A.reset)\n\n"
+
+    if rows.isEmpty {
+        out += "\(A.dim)  No providers found. Configure opencode first: \(A.reset)\(A.cyan)opencode providers login\(A.reset)\n\n"
     }
 
-    private var header: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("AI Limits").font(.headline)
-                Text("Updated \(state.lastUpdated.formatted(date: .omitted, time: .shortened))")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button {
-                Task { await state.refresh() }
-            } label: {
-                Image(systemName: state.isRefreshing ? "arrow.clockwise.circle" : "arrow.clockwise")
-                    .rotationEffect(.degrees(state.isRefreshing ? 360 : 0))
-                    .animation(state.isRefreshing ? .linear(duration: 1).repeatForever(autoreverses: false) : .default, value: state.isRefreshing)
-            }
-            .buttonStyle(.borderless)
-            .help("Refresh")
+    for row in rows {
+        // header line
+        let dot = row.resetProgress > 0.8 ? "\(A.red)●\(A.reset)" :
+                  row.resetProgress > 0.5 ? "\(A.yellow)●\(A.reset)" :
+                  "\(A.green)●\(A.reset)"
+        out += "  \(dot) \(A.bold)\(row.name)\(A.reset) \(A.dim)[\(row.type)]\(A.reset)"
+        if row.label != "—" { out += " \(A.dim)· \(row.label)\(A.reset)" }
+        out += "\n"
+
+        // limits line
+        out += "      limit:      \(A.bold)\(row.limit)\(A.reset)"
+        out += "    remaining: \(A.green)\(row.remaining)\(A.reset)"
+        out += "    reset: \(A.magenta)\(row.resetAt)\(A.reset)\n"
+
+        // progress bar
+        if row.resetProgress > 0 {
+            out += "      \(bar(row.resetProgress))\n"
         }
-        .padding(10)
+
+        // usage line
+        out += "      usage 1d: \(A.cyan)\(row.usageToday)\(A.reset)"
+        out += "  7d: \(A.cyan)\(row.usageWeek)\(A.reset)"
+        out += "  30d: \(A.cyan)\(row.usageMonth)\(A.reset) tokens\n"
+
+        // models
+        if !row.models.isEmpty {
+            out += "      \(A.dim)models: \(A.reset)\n"
+            for m in row.models.prefix(5) {
+                let last = m.lastUsed != nil ? " · \(m.lastUsed!.formatted(.relative(presentation: .named)))" : ""
+                out += "        \(A.magenta)\(m.modelID)\(A.reset)\n"
+                out += "          \(A.dim)\(fmtT(m.inputTokens)) in · \(fmtT(m.outputTokens)) out · \(fmtT(m.cacheRead)) cache · \(m.messages) msgs\(last)\(A.reset)\n"
+            }
+            if row.models.count > 5 {
+                out += "        \(A.dim)+ \(row.models.count - 5) more\(A.reset)\n"
+            }
+        }
+        out += "\n"
     }
 
-    private var footer: some View {
-        HStack {
-            Text("\(state.rows.count) providers")
-                .font(.caption2).foregroundStyle(.secondary)
-            Spacer()
-            Button("Quit") { NSApplication.shared.terminate(nil) }
-                .font(.caption).buttonStyle(.borderless)
+    out += "\(A.dim)  ── q: quit · r: refresh · auto-refresh 60s ──\(A.reset)\n"
+    FileHandle.standardOutput.write(Data(out.utf8))
+}
+
+func fmtT(_ n: Int) -> String {
+    if n >= 1_000_000 { return String(format: "%.1fM", Double(n)/1_000_000) }
+    if n >= 1_000 { return String(format: "%.1fK", Double(n)/1_000) }
+    return "\(n)"
+}
+
+// MARK: - Main loop
+
+var keepRunning = true
+signal(SIGINT) { _ in keepRunning = false }
+setbuf(stdout, nil)
+
+let limits = Limits()
+let lock = NSLock()
+var lastRows: [ProviderRow] = []
+var lastUpdated = Date()
+
+func doFetch() {
+    lock.lock()
+    defer { lock.unlock() }
+    lastRows = limits.fetch()
+    lastUpdated = Date()
+    render(rows: lastRows, updated: lastUpdated, refreshing: false)
+}
+
+// initial fetch
+doFetch()
+
+// background timer
+let queue = DispatchQueue.global(qos: .utility)
+let timer = DispatchSource.makeTimerSource(queue: queue)
+timer.schedule(deadline: .now() + 60, repeating: 60)
+timer.setEventHandler {
+    lock.lock()
+    let refreshing = true
+    let rows = lastRows
+    let updated = lastUpdated
+    lock.unlock()
+    render(rows: rows, updated: updated, refreshing: refreshing)
+    doFetch()
+}
+timer.resume()
+
+// input loop (q to quit, r to refresh)
+DispatchQueue.global(qos: .userInteractive).async {
+    while keepRunning {
+        if let c = readByte() {
+            if c == 113 || c == 81 { // q, Q
+                keepRunning = false
+                break
+            } else if c == 114 || c == 82 { // r, R
+                DispatchQueue.global().async { doFetch() }
+            }
         }
-        .padding(8)
-        .background(.regularMaterial)
     }
 }
 
-struct ProviderCard: View {
-    let row: ProviderRow
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(row.name).font(.system(size: 13, weight: .semibold))
-                    Text("\(row.type) · \(row.label)")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 1) {
-                    Text("limit: \(row.limit)").font(.caption2).foregroundStyle(.secondary)
-                    Text("remaining: \(row.remaining)").font(.caption2).foregroundStyle(row.remaining.contains("$") ? .green : .secondary)
-                }
-            }
-
-            if row.resetProgress > 0 {
-                ProgressView(value: row.resetProgress)
-                    .tint(row.resetProgress > 0.8 ? .red : .accentColor)
-                    .scaleEffect(y: 0.6)
-                HStack {
-                    Text("used \(Int(row.resetProgress*100))%")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text("reset: \(row.resetAt)")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            HStack(spacing: 12) {
-                Label("\(row.usageToday)", systemImage: "calendar")
-                    .labelStyle(.titleAndIcon).font(.caption2)
-                Label("\(row.usageWeek)", systemImage: "clock")
-                    .labelStyle(.titleAndIcon).font(.caption2)
-                Label("\(row.usageMonth)", systemImage: "chart.bar")
-                    .labelStyle(.titleAndIcon).font(.caption2)
-                Spacer()
-                Text("tokens 1d/7d/30d").font(.system(size: 9)).foregroundStyle(.secondary)
-            }
-
-            if !row.models.isEmpty {
-                Divider()
-                VStack(alignment: .leading, spacing: 3) {
-                    ForEach(row.models.prefix(4)) { m in
-                        HStack {
-                            Text(m.modelID)
-                                .font(.system(size: 11, design: .monospaced))
-                                .lineLimit(1)
-                            Spacer()
-                            Text("\(fmtT(m.inputTokens)) in · \(fmtT(m.outputTokens)) out · \(fmtT(m.cacheRead)) cache")
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                        if let last = m.lastUsed {
-                            Text("last: \(last.formatted(.relative(presentation: .named)))")
-                                .font(.system(size: 9))
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                    if row.models.count > 4 {
-                        Text("+ \(row.models.count - 4) more")
-                            .font(.system(size: 9)).foregroundStyle(.secondary)
-                    }
-                }
-            }
-        }
-        .padding(10)
-        .background(.background.secondary)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private func fmtT(_ n: Int) -> String {
-        if n >= 1_000_000 { return String(format: "%.1fM", Double(n)/1_000_000) }
-        if n >= 1_000 { return String(format: "%.1fK", Double(n)/1_000) }
-        return "\(n)"
-    }
+while keepRunning {
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
 }
 
-// MARK: - AppDelegate
+timer.cancel()
+print("\n\(A.dim)Bye.\(A.reset)")
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var statusItem: NSStatusItem!
-    private let state = AppState()
-    private var popover: NSPopover!
-    private var refreshTimer: Timer?
-    private var eventMonitor: Any?
+// MARK: - readByte (poll stdin)
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "speedometer", accessibilityDescription: "AI limits")
-            button.image?.size = NSSize(width: 16, height: 16)
-            button.target = self
-            button.action = #selector(togglePopover(_:))
-        }
-
-        popover = NSPopover()
-        popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: PopoverRoot(state: state))
-        popover.contentSize = NSSize(width: 420, height: 540)
-
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            Task { await self.state.refresh() }
-        }
-
-        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            guard let self else { return }
-            if self.popover.isShown { self.popover.performClose(nil) }
-        }
+func readByte() -> UInt8? {
+    var pfd = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+    let ready = poll(&pfd, 1, 200) // 200ms timeout
+    if ready > 0 && (pfd.revents & Int16(POLLIN)) != 0 {
+        var buf: UInt8 = 0
+        let n = read(STDIN_FILENO, &buf, 1)
+        return n > 0 ? buf : nil
     }
-
-    @objc func togglePopover(_ sender: Any?) {
-        if popover.isShown {
-            popover.performClose(nil)
-        } else {
-            if let button = statusItem.button {
-                popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-                Task { await state.refresh() }
-            }
-        }
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        refreshTimer?.invalidate()
-        if let m = eventMonitor { NSEvent.removeMonitor(m) }
-    }
+    return nil
 }
-
-// MARK: - main
-
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
