@@ -84,10 +84,44 @@ final class Limits {
 
     private func localOnlyRow(providerID: String, type: String, models: [ModelUsage], name: String) -> ProviderRow {
         let (today, week, month) = aggregateWindows(models: models)
+        // rolling 5h window like Claude Code / ChatGPT Plus
+        let windowSec = 5.0 * 3600
+        let windowStart = Date().addingTimeInterval(-windowSec)
+        let windowTokens = queryWindowTokens(providerID: providerID, since: windowStart)
+        let lastUsed = models.compactMap { $0.lastUsed }.max()
+
+        let limit: String
+        let remaining: String
+        let resetAt: String
+        let progress: Double
+
+        if windowTokens > 0 {
+            // active window: show how much of the 5h window is consumed
+            let windowEnd = windowStart.addingTimeInterval(windowSec)
+            let secsToReset = windowEnd.timeIntervalSinceNow
+            let pctWindow = max(0, min(1, 1 - secsToReset / windowSec))
+            limit = "5h window"
+            remaining = "\(fmtTokens(windowTokens)) in window"
+            resetAt = secsToReset > 0 ? "reset in \(humanDuration(secs: secsToReset))" : "window expired"
+            // if window already expired, show 0 (will reset on next message)
+            progress = secsToReset > 0 ? pctWindow : 0
+        } else if let last = lastUsed {
+            // idle: show how long ago last use was
+            let ago = Date().timeIntervalSince(last)
+            limit = "5h window"
+            remaining = "idle"
+            resetAt = ago < windowSec ? "window resets in \(humanDuration(secs: windowSec - ago))" : "no recent use"
+            progress = 0
+        } else {
+            limit = "5h window"
+            remaining = "no usage"
+            resetAt = "—"
+            progress = 0
+        }
         return ProviderRow(
             id: providerID, name: name, type: type, label: "—",
             models: models,
-            limit: "—", remaining: "—", resetAt: "no public limit", resetProgress: 0,
+            limit: limit, remaining: remaining, resetAt: resetAt, resetProgress: progress,
             usageToday: today, usageWeek: week, usageMonth: month
         )
     }
@@ -187,6 +221,34 @@ final class Limits {
             limit: limit, remaining: remaining, resetAt: resetAt, resetProgress: progress,
             usageToday: today, usageWeek: week, usageMonth: month
         )
+    }
+
+    // MARK: rolling window token count
+
+    private func queryWindowTokens(providerID: String, since: Date) -> Int {
+        let sinceMs = Int(since.timeIntervalSince1970 * 1000)
+        let sql = """
+        SELECT
+            coalesce(sum(json_extract(data,'$.tokens.input')),0)
+          + coalesce(sum(json_extract(data,'$.tokens.output')),0)
+          + coalesce(sum(json_extract(data,'$.tokens.cache.read')),0) AS total
+        FROM message
+        WHERE json_extract(data,'$.role')='assistant'
+          AND json_extract(data,'$.providerID')=?
+          AND json_extract(data,'$.time.created') >= ?
+        """
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_close_v2(db) }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, providerID, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_int64(stmt, 2, Int64(sinceMs))
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            return Int(sqlite3_column_int64(stmt, 0))
+        }
+        return 0
     }
 
     // MARK: SQLite
