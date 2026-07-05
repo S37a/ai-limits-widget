@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+*.app/
+*.app
+*.o
+*.d
+ai-limits-widget
+
+# Secrets — never commit
+auth.json
+credentials.json
+.env
+.env.*
+*.key
+secrets/
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.vscode/
+.idea/
+*.xcodeproj/
+xcuserdata/
